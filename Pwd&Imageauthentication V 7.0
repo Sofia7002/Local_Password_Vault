@@ -1,0 +1,1635 @@
+"""
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║       ZERO-KNOWLEDGE LOCAL PASSWORD MANAGER  ·  v7.0                         ║
+║                                                                               ║
+║  NEW IN v7 — IMAGE KEY AUTHENTICATION (2nd Factor)                            ║
+║  ─────────────────────────────────────────────────────────────────────────── ║
+║  Both master password AND a key image are required to unlock the vault.       ║
+║  The image pixel hash is combined with the password inside Argon2id itself    ║
+║  making it mathematically impossible to bypass via code modification.         ║
+║                                                                               ║
+║  I1  SECURITY  Pixel hash (Pillow) + password combined as Argon2id secret    ║
+║  I2  SECURITY  Separate image_verify for fast wrong-image feedback            ║
+║  I3  SECURITY  Honey image — decoy image shows convincing fake vault          ║
+║  I4  UX        Image fingerprint shown at setup for backup verification       ║
+║  I5  COMPAT    auth_mode + vault schema v4                                    ║
+║                                                                               ║
+║  ALL PREVIOUS FIXES (v3-v6) RETAINED                                          ║
+║                                                                               ║
+║  INSTALL & RUN                                                                ║
+║  pip install cryptography argon2-cffi Pillow                                  ║
+║  python password_manager_v7.py                                                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STDLIB
+# ─────────────────────────────────────────────────────────────────────────────
+import atexit
+import base64
+import ctypes
+import hashlib
+import hmac
+import json
+import os
+import platform
+import secrets
+import string
+import sys
+import threading
+import time
+import tkinter as tk
+import uuid
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  THIRD-PARTY
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from argon2.low_level import Type, hash_secret_raw
+except ImportError:
+    sys.exit("\n[FATAL] argon2-cffi not installed.\n  Run: pip install argon2-cffi\n")
+
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    sys.exit("\n[FATAL] cryptography not installed.\n  Run: pip install cryptography\n")
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("\n[FATAL] Pillow not installed.\n  Run: pip install Pillow\n")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LAYER 3 — CRYPTOGRAPHIC ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+KDF_MEMORY_COST = 8_192
+KDF_TIME_COST   = 1
+KDF_PARALLELISM = 1
+KDF_KEY_LEN     = 32
+MASTER_SALT_LEN = 16
+ENTRY_SALT_LEN  = 16
+NONCE_LEN       = 12
+
+KDF_PARAMS: dict = {
+    "algorithm":   "argon2id",
+    "version":     19,
+    "memory_kb":   KDF_MEMORY_COST,
+    "iterations":  KDF_TIME_COST,
+    "parallelism": KDF_PARALLELISM,
+    "key_len":     KDF_KEY_LEN,
+    "salt_len":    MASTER_SALT_LEN,
+}
+
+# Fixed domain-separation salts — never change, changing invalidates all vaults
+_KEY_HASH_SALT:   bytes = b"pm-v3-key-verif\x00"
+_IMAGE_HASH_SALT: bytes = b"pm-v7-img-verif\x00"
+_HONEY_HASH_SALT: bytes = b"pm-v7-honey-img\x00"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+def _b64d(s: str) -> bytes:
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64: {exc}") from exc
+
+def _rand_bytes(n: int) -> bytes:
+    return secrets.token_bytes(n)
+
+# ── RAM Zeroing ───────────────────────────────────────────────────────────────
+
+def zero_bytes(buf) -> None:
+    if buf is None:
+        return
+    if isinstance(buf, bytearray):
+        for i in range(len(buf)):
+            buf[i] = 0
+        return
+    try:
+        if isinstance(buf, str):
+            buf = buf.encode("utf-8")
+        if isinstance(buf, (bytes, memoryview)):
+            nbytes = len(buf)
+            ctypes.memset(id(buf) + sys.getsizeof(b"") - nbytes, 0, nbytes)
+    except Exception:
+        pass
+
+# ── Image Key ─────────────────────────────────────────────────────────────────
+
+def extract_pixel_hash(image_path: str) -> bytes:
+    """
+    Load image via Pillow and return SHA-256 of raw pixel bytes.
+
+    Uses pixel data ONLY (not file bytes) so:
+      - Metadata changes (EXIF, date modified) do NOT change the hash
+      - A clean file copy always gives the same hash
+      - Any visible edit (crop/resize/filter) DOES change the hash
+
+    Converts to RGBA for consistency across JPG/PNG/BMP formats.
+    Raises ValueError on unreadable image.
+    """
+    try:
+        with Image.open(image_path) as img:
+            pixel_bytes = img.convert("RGBA").tobytes()
+    except Exception as exc:
+        raise ValueError(f"Cannot read image: {exc}") from exc
+    return hashlib.sha256(pixel_bytes).digest()  # 32 bytes
+
+def image_fingerprint(pixel_hash: bytes) -> str:
+    """Short human-readable fingerprint for display/verification."""
+    h = pixel_hash.hex()
+    return "  ".join(h[i:i+8] for i in range(0, 32, 8))
+
+# ── KDF & Encryption ──────────────────────────────────────────────────────────
+
+def derive_master_key(password: str, master_salt: bytes,
+                       pixel_hash: bytes) -> bytearray:
+    """
+    Argon2id(password_bytes + pixel_hash, master_salt) → 256-bit key.
+
+    Both factors combined at mathematical level.
+    Wrong password OR wrong image → different key → AES-GCM tag fails.
+    Caller MUST zero_bytes() result.
+    """
+    secret_ba = bytearray(password.encode("utf-8") + pixel_hash)
+    raw = hash_secret_raw(
+        secret      = bytes(secret_ba),
+        salt        = master_salt,
+        time_cost   = KDF_TIME_COST,
+        memory_cost = KDF_MEMORY_COST,
+        parallelism = KDF_PARALLELISM,
+        hash_len    = KDF_KEY_LEN,
+        type        = Type.ID,
+    )
+    zero_bytes(secret_ba)
+    return bytearray(raw)
+
+def hash_master_key(key: bytearray) -> str:
+    """Argon2id(key, fixed_salt) → Base64. For login verification only."""
+    digest = hash_secret_raw(
+        secret=bytes(key), salt=_KEY_HASH_SALT,
+        time_cost=1, memory_cost=8_192, parallelism=1,
+        hash_len=32, type=Type.ID,
+    )
+    return _b64e(digest)
+
+def hash_image_for_verify(pixel_hash: bytes, image_salt: bytes) -> str:
+    """Argon2id(pixel_hash, image_salt) → Base64. Stored as image_verify."""
+    digest = hash_secret_raw(
+        secret=pixel_hash, salt=image_salt,
+        time_cost=1, memory_cost=8_192, parallelism=1,
+        hash_len=32, type=Type.ID,
+    )
+    return _b64e(digest)
+
+def hash_honey_image(pixel_hash: bytes) -> str:
+    """Argon2id(pixel_hash, fixed_honey_salt) → Base64. Stored as honey_verify."""
+    digest = hash_secret_raw(
+        secret=pixel_hash, salt=_HONEY_HASH_SALT,
+        time_cost=1, memory_cost=8_192, parallelism=1,
+        hash_len=32, type=Type.ID,
+    )
+    return _b64e(digest)
+
+def derive_entry_key(master_key: bytearray, entry_salt: bytes) -> bytearray:
+    secret_ba = bytearray(bytes(master_key).hex().encode("utf-8") + b"entry-v3")
+    raw = hash_secret_raw(
+        secret=bytes(secret_ba), salt=entry_salt,
+        time_cost=1, memory_cost=8_192, parallelism=1,
+        hash_len=KDF_KEY_LEN, type=Type.ID,
+    )
+    zero_bytes(secret_ba)
+    return bytearray(raw)
+
+def encrypt_payload(entry_key: bytearray, plaintext: str) -> tuple[bytes, bytes]:
+    nonce  = _rand_bytes(NONCE_LEN)
+    ct     = AESGCM(bytes(entry_key)).encrypt(nonce, plaintext.encode("utf-8"), None)
+    return ct, nonce
+
+def decrypt_payload(entry_key: bytearray, ciphertext: bytes, nonce: bytes) -> str:
+    return AESGCM(bytes(entry_key)).decrypt(nonce, ciphertext, None).decode("utf-8")
+
+def generate_password(length: int = 20, upper: bool = True,
+                       digits: bool = True, symbols: bool = True) -> str:
+    pool     = string.ascii_lowercase
+    required = [secrets.choice(string.ascii_lowercase)]
+    if upper:
+        pool += string.ascii_uppercase
+        required.append(secrets.choice(string.ascii_uppercase))
+    if digits:
+        pool += string.digits
+        required.append(secrets.choice(string.digits))
+    if symbols:
+        sym   = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+        pool += sym
+        required.append(secrets.choice(sym))
+    result = required + [secrets.choice(pool) for _ in range(length - len(required))]
+    for i in range(len(result) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        result[i], result[j] = result[j], result[i]
+    return "".join(result)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LAYER 4 — PERSISTENCE
+# ═════════════════════════════════════════════════════════════════════════════
+
+VAULT_FILE: Path  = Path(__file__).resolve().parent / "vault.json"
+_IS_WINDOWS: bool = platform.system() == "Windows"
+
+_REQUIRED_META_KEYS  = {"version", "auth_mode", "master_salt", "master_hash",
+                         "image_salt", "image_verify", "honey_verify", "kdf_params"}
+_REQUIRED_ENTRY_KEYS = {"id", "name", "url", "encrypted_payload",
+                         "entry_salt", "nonce", "created_at", "modified_at"}
+
+def vault_exists() -> bool:
+    return VAULT_FILE.exists()
+
+def _validate_vault(vault: dict) -> None:
+    if not isinstance(vault, dict):
+        raise ValueError("Vault root is not a JSON object.")
+    if "meta" not in vault or "entries" not in vault:
+        raise ValueError("Vault missing meta or entries.")
+    meta    = vault["meta"]
+    missing = _REQUIRED_META_KEYS - set(meta.keys())
+    if missing:
+        raise ValueError(f"Vault meta missing: {missing}")
+    if not isinstance(vault["entries"], list):
+        raise ValueError("entries is not a list.")
+    for i, e in enumerate(vault["entries"]):
+        miss = _REQUIRED_ENTRY_KEYS - set(e.keys())
+        if miss:
+            raise ValueError(f"Entry #{i} missing: {miss}")
+        try:
+            sb = _b64d(e["entry_salt"])
+            nb = _b64d(e["nonce"])
+        except ValueError as exc:
+            raise ValueError(f"Entry #{i} bad base64: {exc}") from exc
+        if len(sb) != ENTRY_SALT_LEN:
+            raise ValueError(f"Entry #{i} entry_salt wrong length")
+        if len(nb) != NONCE_LEN:
+            raise ValueError(f"Entry #{i} nonce wrong length")
+
+def _read() -> dict:
+    try:
+        with open(VAULT_FILE, "r", encoding="utf-8") as fh:
+            vault = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"vault.json not valid JSON: {exc}") from exc
+    _validate_vault(vault)
+    return vault
+
+def _write(vault: dict) -> None:
+    tmp = VAULT_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(vault, fh, indent=2, ensure_ascii=False)
+    if not _IS_WINDOWS:
+        os.chmod(tmp, 0o600)
+    tmp.replace(VAULT_FILE)
+    if not _IS_WINDOWS:
+        os.chmod(VAULT_FILE, 0o600)
+
+def create_vault(password: str, key_image_path: str,
+                  honey_image_path: str) -> str:
+    """Create new vault. Returns image fingerprint for display."""
+    pixel_hash   = extract_pixel_hash(key_image_path)
+    honey_hash   = extract_pixel_hash(honey_image_path)
+    master_salt  = _rand_bytes(MASTER_SALT_LEN)
+    image_salt   = _rand_bytes(MASTER_SALT_LEN)
+    key          = derive_master_key(password, master_salt, pixel_hash)
+    master_hash  = hash_master_key(key)
+    zero_bytes(key)
+    vault = {
+        "meta": {
+            "version":      4,
+            "auth_mode":    "password+image",
+            "master_salt":  _b64e(master_salt),
+            "master_hash":  master_hash,
+            "image_salt":   _b64e(image_salt),
+            "image_verify": hash_image_for_verify(pixel_hash, image_salt),
+            "honey_verify": hash_honey_image(honey_hash),
+            "kdf_params":   KDF_PARAMS,
+        },
+        "entries": [],
+    }
+    _write(vault)
+    return image_fingerprint(pixel_hash)
+
+# ── Login result codes ────────────────────────────────────────────────────────
+LOGIN_OK        = "ok"
+LOGIN_WRONG_IMG = "wrong_image"
+LOGIN_WRONG_PWD = "wrong_password"
+LOGIN_HONEY     = "honey"
+LOGIN_ERROR     = "error"
+
+def verify_and_load_key(password: str,
+                         image_path: str) -> tuple[str, Optional[bytearray]]:
+    """
+    Full 2-factor verification. Returns (status_code, key_or_None).
+
+    Order:
+      1. Read vault meta
+      2. Extract pixel hash from image
+      3. Honey check first — if match return LOGIN_HONEY immediately
+      4. Image verify check — if fail return LOGIN_WRONG_IMG
+      5. Derive combined master key
+      6. Key hash check — if fail return LOGIN_WRONG_PWD
+      7. Return LOGIN_OK + key
+    """
+    try:
+        meta = _read()["meta"]
+    except ValueError:
+        return LOGIN_ERROR, None
+    try:
+        pixel_hash = extract_pixel_hash(image_path)
+    except ValueError:
+        return LOGIN_ERROR, None
+
+    # Honey check
+    if hmac.compare_digest(hash_honey_image(pixel_hash), meta["honey_verify"]):
+        return LOGIN_HONEY, None
+
+    # Image verify
+    try:
+        image_salt = _b64d(meta["image_salt"])
+    except ValueError:
+        return LOGIN_ERROR, None
+    if not hmac.compare_digest(
+            hash_image_for_verify(pixel_hash, image_salt),
+            meta["image_verify"]):
+        return LOGIN_WRONG_IMG, None
+
+    # Combined key derivation + password verify
+    try:
+        master_salt = _b64d(meta["master_salt"])
+    except ValueError:
+        return LOGIN_ERROR, None
+    key = derive_master_key(password, master_salt, pixel_hash)
+    if not hmac.compare_digest(hash_master_key(key), meta["master_hash"]):
+        zero_bytes(key)
+        return LOGIN_WRONG_PWD, None
+
+    return LOGIN_OK, key
+
+# ── Entry CRUD ────────────────────────────────────────────────────────────────
+
+def storage_list_entries() -> list[dict]:
+    try:
+        return _read()["entries"]
+    except ValueError:
+        return []
+
+def storage_add_entry(master_key: bytearray, name: str, url: str,
+                       username: str, password: str, notes: str) -> str:
+    entry_salt = _rand_bytes(ENTRY_SALT_LEN)
+    entry_key  = derive_entry_key(master_key, entry_salt)
+    payload    = json.dumps({"username": username, "password": password,
+                              "notes": notes}, ensure_ascii=False)
+    ct, nonce  = encrypt_payload(entry_key, payload)
+    zero_bytes(entry_key)
+    eid = str(uuid.uuid4()); now = int(time.time())
+    vault = _read()
+    vault["entries"].append({
+        "id": eid, "name": name, "url": url,
+        "encrypted_payload": _b64e(ct),
+        "entry_salt": _b64e(entry_salt),
+        "nonce": _b64e(nonce),
+        "created_at": now, "modified_at": now,
+    })
+    _write(vault)
+    return eid
+
+def storage_decrypt_entry(master_key: bytearray,
+                            entry_id: str) -> Optional[dict]:
+    try:
+        entries = _read()["entries"]
+    except ValueError:
+        return None
+    for e in entries:
+        if e["id"] != entry_id:
+            continue
+        entry_key = None
+        try:
+            entry_key = derive_entry_key(master_key, _b64d(e["entry_salt"]))
+            raw       = decrypt_payload(entry_key,
+                                         _b64d(e["encrypted_payload"]),
+                                         _b64d(e["nonce"]))
+            result    = json.loads(raw)
+        except (InvalidTag, ValueError, KeyError):
+            return None
+        finally:
+            zero_bytes(entry_key)
+        result.update({"id": e["id"], "name": e["name"], "url": e["url"]})
+        return result
+    return None
+
+def storage_update_entry(master_key: bytearray, entry_id: str,
+                          name: str, url: str, username: str,
+                          password: str, notes: str) -> bool:
+    try:
+        vault = _read()
+    except ValueError:
+        return False
+    for e in vault["entries"]:
+        if e["id"] != entry_id:
+            continue
+        entry_salt = _rand_bytes(ENTRY_SALT_LEN)
+        entry_key  = derive_entry_key(master_key, entry_salt)
+        payload    = json.dumps({"username": username, "password": password,
+                                  "notes": notes}, ensure_ascii=False)
+        ct, nonce  = encrypt_payload(entry_key, payload)
+        zero_bytes(entry_key)
+        e.update({
+            "name": name, "url": url,
+            "encrypted_payload": _b64e(ct),
+            "entry_salt": _b64e(entry_salt),
+            "nonce": _b64e(nonce),
+            "modified_at": int(time.time()),
+        })
+        _write(vault)
+        return True
+    return False
+
+def storage_delete_entry(entry_id: str) -> bool:
+    try:
+        vault = _read()
+    except ValueError:
+        return False
+    before           = len(vault["entries"])
+    vault["entries"] = [e for e in vault["entries"] if e["id"] != entry_id]
+    if len(vault["entries"]) < before:
+        _write(vault)
+        return True
+    return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LAYER 2 — BUSINESS LOGIC
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEAD_WAIT_SECS      = 2
+CLIPBOARD_CLEAR_SEC = 30
+AUTO_LOCK_SEC       = 300
+
+
+class Session:
+
+    def __init__(self):
+        self._key: Optional[bytearray]              = None
+        self._cb_timer: Optional[threading.Timer]   = None
+        self._lock_timer: Optional[threading.Timer] = None
+        self._on_auto_lock_cb                       = None
+        self._atexit_registered: bool               = False
+
+    def login(self, password: str, image_path: str) -> str:
+        """Full 2FA login. Returns LOGIN_* status code."""
+        status, key = verify_and_load_key(password, image_path)
+        if status == LOGIN_WRONG_PWD:
+            time.sleep(DEAD_WAIT_SECS)
+            return LOGIN_WRONG_PWD
+        if status == LOGIN_OK:
+            self._key = key
+            if not self._atexit_registered:
+                atexit.register(self._atexit_cleanup)
+                self._atexit_registered = True
+            self._reset_lock_timer()
+        return status
+
+    def logout(self) -> None:
+        zero_bytes(self._key)
+        self._key = None
+        self._cancel_cb_timer()
+        self._cancel_lock_timer()
+
+    def _atexit_cleanup(self) -> None:
+        try:
+            zero_bytes(self._key)
+            self._key = None
+        except Exception:
+            pass
+
+    @property
+    def active(self) -> bool:
+        return self._key is not None
+
+    def _assert_auth(self) -> None:
+        if not self.active:
+            raise PermissionError("Session not authenticated.")
+
+    def touch(self) -> None:
+        if self.active:
+            self._reset_lock_timer()
+
+    def add(self, name, url, username, password, notes) -> str:
+        self._assert_auth(); self.touch()
+        return storage_add_entry(self._key, name, url, username, password, notes)
+
+    def decrypt(self, entry_id: str) -> Optional[dict]:
+        self._assert_auth(); self.touch()
+        return storage_decrypt_entry(self._key, entry_id)
+
+    def update(self, entry_id, name, url, username, password, notes) -> bool:
+        self._assert_auth(); self.touch()
+        return storage_update_entry(self._key, entry_id, name, url,
+                                     username, password, notes)
+
+    def delete(self, entry_id: str) -> bool:
+        self._assert_auth(); self.touch()
+        return storage_delete_entry(entry_id)
+
+    def copy_to_clipboard(self, root: tk.Tk, text: str) -> None:
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        self._cancel_cb_timer()
+        self._cb_timer = threading.Timer(
+            CLIPBOARD_CLEAR_SEC, self._wipe_clipboard, args=(root, text))
+        self._cb_timer.daemon = True
+        self._cb_timer.start()
+        self.touch()
+
+    def _wipe_clipboard(self, root: tk.Tk, original: str) -> None:
+        def _do():
+            try:
+                root.clipboard_clear()
+                root.clipboard_append("")
+            except Exception:
+                pass
+        try:
+            root.after(0, _do)
+        except Exception:
+            pass
+        finally:
+            zero_bytes(bytearray(original.encode("utf-8")))
+
+    def _cancel_cb_timer(self) -> None:
+        if self._cb_timer and self._cb_timer.is_alive():
+            self._cb_timer.cancel()
+        self._cb_timer = None
+
+    def _reset_lock_timer(self) -> None:
+        self._cancel_lock_timer()
+        self._lock_timer = threading.Timer(AUTO_LOCK_SEC, self._trigger_auto_lock)
+        self._lock_timer.daemon = True
+        self._lock_timer.start()
+
+    def _cancel_lock_timer(self) -> None:
+        if self._lock_timer and self._lock_timer.is_alive():
+            self._lock_timer.cancel()
+        self._lock_timer = None
+
+    def _trigger_auto_lock(self) -> None:
+        self.logout()
+        if callable(self._on_auto_lock_cb):
+            try:
+                self._on_auto_lock_cb()
+            except Exception:
+                pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LAYER 1 — PRESENTATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+_C = {
+    "bg":      "#0d0f14",
+    "panel":   "#13161d",
+    "border":  "#1e2330",
+    "accent":  "#00d4ff",
+    "accent2": "#ff4757",
+    "fg":      "#dce3f0",
+    "fg2":     "#5a6480",
+    "fg3":     "#8892aa",
+    "input":   "#0a0c11",
+    "success": "#00e676",
+    "warning": "#ffab40",
+    "btn":     "#1a1f2e",
+    "btn_h":   "#252c3f",
+    "honey":   "#ff9f43",
+}
+
+_F  = ("Consolas", 10)
+_FB = ("Consolas", 10, "bold")
+_FH = ("Consolas", 13, "bold")
+_FS = ("Consolas", 9)
+_FT = ("Consolas", 17, "bold")
+
+
+def _apply_theme(root: tk.Tk) -> None:
+    root.configure(bg=_C["bg"])
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".", background=_C["bg"], foreground=_C["fg"],
+                font=_F, borderwidth=0, relief="flat",
+                fieldbackground=_C["input"])
+    s.configure("TFrame",  background=_C["bg"])
+    s.configure("TLabel",  background=_C["bg"], foreground=_C["fg"])
+    s.configure("TEntry",  fieldbackground=_C["input"], foreground=_C["fg"],
+                insertcolor=_C["accent"], borderwidth=1, relief="flat")
+    s.configure("TScrollbar", background=_C["border"], troughcolor=_C["bg"],
+                arrowcolor=_C["fg2"], width=8)
+    s.configure("Treeview", background=_C["panel"], foreground=_C["fg"],
+                fieldbackground=_C["panel"], rowheight=30, borderwidth=0)
+    s.configure("Treeview.Heading", background=_C["border"],
+                foreground=_C["accent"], font=_FB, relief="flat")
+    s.map("Treeview",
+          background=[("selected", _C["accent"])],
+          foreground=[("selected", _C["bg"])])
+    s.configure("Accent.TButton", background=_C["accent"], foreground=_C["bg"],
+                font=_FB, padding=(12, 6), relief="flat")
+    s.map("Accent.TButton",
+          background=[("active", "#00b8d9"), ("disabled", _C["border"])])
+    s.configure("Danger.TButton", background=_C["accent2"], foreground="white",
+                font=_FB, padding=(10, 5), relief="flat")
+    s.map("Danger.TButton", background=[("active", "#cc2233")])
+    s.configure("Ghost.TButton", background=_C["btn"], foreground=_C["fg3"],
+                font=_F, padding=(8, 4), relief="flat")
+    s.map("Ghost.TButton",
+          background=[("active", _C["btn_h"])],
+          foreground=[("active", _C["fg"])])
+    s.configure("TCheckbutton", background=_C["bg"], foreground=_C["fg3"])
+    s.map("TCheckbutton", background=[("active", _C["bg"])])
+
+
+def _center(win, w: int, h: int) -> None:
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+
+def _sep(parent) -> tk.Frame:
+    return tk.Frame(parent, height=1, bg=_C["border"])
+
+
+def _lbl(parent, text="", color=None, font=None, **kw) -> ttk.Label:
+    cfg = {}
+    if color: cfg["foreground"] = color
+    if font:  cfg["font"]       = font
+    return ttk.Label(parent, text=text, **cfg, **kw)
+
+
+def _entry(parent, show=None, width=30, **kw) -> ttk.Entry:
+    return ttk.Entry(parent, show=show, width=width, **kw)
+
+
+def _btn(parent, text, cmd, style="Ghost.TButton", **kw) -> ttk.Button:
+    return ttk.Button(parent, text=text, command=cmd, style=style, **kw)
+
+
+def _toast(root: tk.Tk, message: str, ms: int = 1000) -> None:
+    try:
+        t = tk.Toplevel(root)
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        t.configure(bg=_C["accent"])
+        root.update_idletasks()
+        rx = root.winfo_rootx() + root.winfo_width()  - 240
+        ry = root.winfo_rooty() + root.winfo_height() - 58
+        t.geometry(f"232x32+{rx}+{ry}")
+        inner = tk.Frame(t, bg=_C["panel"], padx=10)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Label(inner, text=f"  \u2713  {message}",
+                 bg=_C["panel"], fg=_C["accent"],
+                 font=("Consolas", 9), anchor="w").pack(fill="both", expand=True)
+        root.after(ms, lambda: t.destroy() if t.winfo_exists() else None)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Image Picker Row  (reused in SetupDialog and LockScreen)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImagePickerRow(tk.Frame):
+    """Label + truncated path display + Browse button."""
+
+    def __init__(self, parent, label: str, **kw):
+        super().__init__(parent, bg=_C["bg"], **kw)
+        self._path = ""
+        if label:
+            tk.Label(self, text=label, bg=_C["bg"], fg=_C["fg2"],
+                     font=_FS, width=14, anchor="w").pack(side="left")
+        self._display = tk.Label(self, text="No file selected",
+                                  bg=_C["input"], fg=_C["fg3"],
+                                  font=_FS, anchor="w", width=30,
+                                  relief="flat", padx=6)
+        self._display.pack(side="left", padx=(4, 6))
+        tk.Button(self, text="Browse\u2026",
+                  bg=_C["btn"], fg=_C["fg"], font=_FS,
+                  relief="flat", cursor="hand2",
+                  command=self._browse).pack(side="left")
+
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp"),
+                ("All files", "*.*"),
+            ])
+        if path:
+            self._path = path
+            name    = Path(path).name
+            display = name if len(name) <= 32 else name[:29] + "..."
+            self._display.config(text=display, fg=_C["fg"])
+
+    def get_path(self) -> str:
+        return self._path
+
+    def set_error(self):
+        self._display.config(fg=_C["accent2"])
+
+    def clear_error(self):
+        self._display.config(fg=_C["fg"] if self._path else _C["fg3"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Setup Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SetupDialog(tk.Toplevel):
+
+    def __init__(self, master: tk.Tk):
+        super().__init__(master)
+        self.title("Initialize Vault \u2014 v7")
+        self.configure(bg=_C["bg"])
+        self.resizable(False, False)
+        _center(self, 520, 580)
+        self.grab_set()
+        self.result = False
+        self._build()
+
+    def _build(self):
+        tk.Frame(self, bg=_C["accent"], height=2).pack(fill="x")
+        hdr = tk.Frame(self, bg=_C["panel"])
+        hdr.pack(fill="x")
+        _lbl(hdr, "  \u2b21  INITIALIZE VAULT", font=_FT,
+             color=_C["accent"]).pack(anchor="w", padx=20, pady=12)
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
+
+        # Warning panel
+        warn = tk.Frame(self, bg="#1a1400")
+        warn.pack(fill="x")
+        tk.Label(warn,
+                 text=(
+                     "  \u26a0  BOTH master password AND key image are required to unlock.\n"
+                     "  \u26a0  If you lose the key image the vault CANNOT be recovered.\n"
+                     "  \u26a0  Back up the key image to at least 2 locations (USB drives).\n"
+                     "  \u26a0  Never edit, compress, or send via WhatsApp/Telegram.\n"
+                     "  \u2713  A plain file copy (USB, cloud download) works perfectly."
+                 ),
+                 bg="#1a1400", fg=_C["warning"],
+                 font=("Consolas", 8), justify="left",
+                 padx=10, pady=8).pack(fill="x")
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
+
+        # Form
+        f = ttk.Frame(self); f.pack(fill="x", padx=24, pady=8)
+        f.columnconfigure(0, weight=1)
+
+        _lbl(f, "Master Password", color=_C["fg3"], font=_FS).grid(
+            row=0, sticky="w", pady=(8, 2))
+        self._pw1 = _entry(f, show="\u25cf", width=36)
+        self._pw1.grid(row=1, sticky="ew")
+
+        _lbl(f, "Confirm Password", color=_C["fg3"], font=_FS).grid(
+            row=2, sticky="w", pady=(8, 2))
+        self._pw2 = _entry(f, show="\u25cf", width=36)
+        self._pw2.grid(row=3, sticky="ew")
+
+        # Strength meter
+        self._str_var = tk.StringVar()
+        self._str_lbl = tk.Label(self, textvariable=self._str_var,
+                                  bg=_C["bg"], fg=_C["fg2"],
+                                  font=_FS, anchor="w")
+        self._str_lbl.pack(padx=24, anchor="w", pady=2)
+        self._pw1.bind("<KeyRelease>", self._on_key)
+
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x", padx=24, pady=4)
+
+        # Key image picker
+        ki = tk.Frame(self, bg=_C["bg"]); ki.pack(fill="x", padx=24, pady=4)
+        tk.Label(ki, text="KEY IMAGE  \u2014  required to unlock vault",
+                 bg=_C["bg"], fg=_C["accent"], font=_FS).pack(anchor="w", pady=(0, 4))
+        self._key_picker = ImagePickerRow(ki, "Key Image:")
+        self._key_picker.pack(fill="x")
+
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x", padx=24, pady=4)
+
+        # Honey image picker
+        hi = tk.Frame(self, bg=_C["bg"]); hi.pack(fill="x", padx=24, pady=4)
+        tk.Label(hi, text="HONEY IMAGE  \u2014  decoy that shows fake vault",
+                 bg=_C["bg"], fg=_C["honey"], font=_FS).pack(anchor="w", pady=(0, 2))
+        tk.Label(hi,
+                 text="Select a DIFFERENT image. Attacker selecting this sees a fake vault.",
+                 bg=_C["bg"], fg=_C["fg2"], font=_FS).pack(anchor="w", pady=(0, 4))
+        self._honey_picker = ImagePickerRow(hi, "Honey Image:")
+        self._honey_picker.pack(fill="x")
+
+        # Error + fingerprint
+        self._err = tk.Label(self, text="", bg=_C["bg"], fg=_C["accent2"],
+                              font=_FS, anchor="w")
+        self._err.pack(padx=24, anchor="w", pady=(8, 0))
+
+        self._fp_var = tk.StringVar()
+        tk.Label(self, textvariable=self._fp_var,
+                 bg=_C["bg"], fg=_C["success"],
+                 font=("Consolas", 8), anchor="w",
+                 wraplength=470, justify="left").pack(padx=24, anchor="w")
+
+        # Buttons
+        bf = ttk.Frame(self); bf.pack(padx=24, pady=12, anchor="w")
+        _btn(bf, "  CREATE VAULT  ", self._submit,
+             style="Accent.TButton").pack(side="left", padx=(0, 8))
+        _btn(bf, "Cancel", self.destroy).pack(side="left")
+        self._pw1.focus_set()
+        self.bind("<Return>", lambda _: self._submit())
+
+    def _on_key(self, _=None):
+        pw    = self._pw1.get()
+        score = sum([
+            len(pw) >= 5,
+            len(pw) >= 20,
+            any(c.isupper() for c in pw),
+            any(c.isdigit() for c in pw),
+            any(c in "!@#$%^&*()-_=+[]{}|;:,.<>?" for c in pw),
+        ])
+        labels = ["", "\u25cf WEAK", "\u25cf\u25cf FAIR",
+                  "\u25cf\u25cf\u25cf GOOD",
+                  "\u25cf\u25cf\u25cf\u25cf STRONG",
+                  "\u25cf\u25cf\u25cf\u25cf\u25cf EXCELLENT"]
+        colors = ["", _C["accent2"], _C["warning"], _C["fg3"],
+                  _C["success"], _C["accent"]]
+        self._str_var.set(labels[score] if score else "")
+        self._str_lbl.config(fg=colors[score] if score else _C["fg2"])
+
+    def _submit(self):
+        p1       = self._pw1.get()
+        p2       = self._pw2.get()
+        key_path = self._key_picker.get_path()
+        hon_path = self._honey_picker.get_path()
+
+        def _err(msg):
+            self._err.config(text=f"\u26a0  {msg}", fg=_C["accent2"])
+
+        if len(p1) < 5:
+            _err("Password must be at least 5 characters."); return
+        if p1 != p2:
+            _err("Passwords do not match."); return
+        if not key_path:
+            _err("Please select a key image.")
+            self._key_picker.set_error(); return
+        if not hon_path:
+            _err("Please select a honey (decoy) image.")
+            self._honey_picker.set_error(); return
+        if key_path == hon_path:
+            _err("Key image and honey image must be different files."); return
+
+        self._err.config(text="\u23f3  Creating vault\u2026", fg=_C["fg3"])
+        self.update_idletasks()
+
+        def _do():
+            try:
+                fp = create_vault(p1, key_path, hon_path)
+                zero_bytes(bytearray(p1.encode()))
+                zero_bytes(bytearray(p2.encode()))
+                def _done():
+                    self._err.config(
+                        text="\u2713  Vault created! Save your fingerprint below.",
+                        fg=_C["success"])
+                    self._fp_var.set(
+                        "Key image fingerprint (save this to verify your image later):\n"
+                        + fp)
+                    self.result = True
+                    self.after(3000, self.destroy)
+                self.after(0, _done)
+            except Exception as exc:
+                self.after(0, lambda: self._err.config(
+                    text=f"\u26a0  Error: {exc}", fg=_C["accent2"]))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lock Screen
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LockScreen(tk.Toplevel):
+
+    def __init__(self, master: tk.Tk, session: Session):
+        super().__init__(master)
+        self.title("Vault Locked \u2014 v7")
+        self.configure(bg=_C["bg"])
+        self.resizable(False, False)
+        _center(self, 440, 370)
+        self.grab_set()
+        self.session  = session
+        self.unlocked = False
+        self._honey   = False
+        self._build()
+
+    def _build(self):
+        tk.Frame(self, bg=_C["accent"], height=2).pack(fill="x")
+        tk.Frame(self, height=14, bg=_C["bg"]).pack()
+        _lbl(self, "  \U0001f512  VAULT LOCKED", font=_FT,
+             color=_C["accent"]).pack(padx=28, anchor="w")
+        tk.Frame(self, height=4, bg=_C["bg"]).pack()
+        _sep(self).pack(fill="x", padx=28)
+        tk.Frame(self, height=10, bg=_C["bg"]).pack()
+
+        # Password field
+        f = ttk.Frame(self); f.pack(fill="x", padx=28)
+        _lbl(f, "MASTER PASSWORD", color=_C["fg2"], font=_FS).pack(anchor="w")
+        self._pw_var = tk.StringVar()
+        pw_e = _entry(f, show="\u25cf", textvariable=self._pw_var, width=36)
+        pw_e.pack(fill="x", pady=(4, 0))
+        pw_e.focus_set()
+
+        # Key image picker
+        tk.Frame(self, height=10, bg=_C["bg"]).pack()
+        ki = tk.Frame(self, bg=_C["bg"]); ki.pack(fill="x", padx=28)
+        _lbl(ki, "KEY IMAGE", color=_C["fg2"], font=_FS).pack(anchor="w", pady=(0, 4))
+        self._img_picker = ImagePickerRow(ki, "")
+        self._img_picker.pack(fill="x")
+
+        # Status banner
+        bw = tk.Frame(self, bg=_C["bg"], height=36)
+        bw.pack(fill="x", padx=28, pady=(10, 0))
+        bw.pack_propagate(False)
+        self._banner = tk.Frame(bw, bg=_C["border"])
+        self._banner.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._msg = tk.Label(
+            self._banner,
+            text="  Enter password and select key image",
+            bg=_C["border"], fg=_C["fg2"],
+            font=("Consolas", 9), anchor="w")
+        self._msg.pack(fill="both", expand=True, padx=8)
+
+        # Buttons
+        bf = ttk.Frame(self); bf.pack(padx=28, pady=10, anchor="w")
+        _btn(bf, "  UNLOCK  ", self._submit,
+             style="Accent.TButton").pack(side="left", padx=(0, 8))
+        _btn(bf, "Cancel", self.destroy).pack(side="left")
+        self.bind("<Return>", lambda _: self._submit())
+
+    def _set_banner(self, text: str, bg: str, fg: str = "white", bold: bool = False):
+        font = ("Consolas", 10, "bold") if bold else ("Consolas", 9)
+        self._banner.config(bg=bg)
+        self._msg.config(text=text, bg=bg, fg=fg, font=font)
+
+    def _submit(self):
+        pw       = self._pw_var.get()
+        img_path = self._img_picker.get_path()
+
+        if not pw:
+            self._set_banner("  \u26a0  Enter your master password",
+                              _C["border"], _C["warning"])
+            return
+        if not img_path:
+            self._set_banner("  \u26a0  Select your key image",
+                              _C["border"], _C["warning"])
+            self._img_picker.set_error()
+            return
+
+        self._pw_var.set("")
+        self._img_picker.clear_error()
+        self._set_banner("  \u23f3  Verifying\u2026", _C["border"], _C["fg3"])
+        self.update_idletasks()
+
+        def _auth():
+            status = self.session.login(pw, img_path)
+            zero_bytes(bytearray(pw.encode()))
+
+            def _ui():
+                if status == LOGIN_OK:
+                    self.unlocked = True
+                    self.destroy()
+                elif status == LOGIN_HONEY:
+                    self._honey = True
+                    self.destroy()
+                elif status == LOGIN_WRONG_IMG:
+                    self._set_banner(
+                        "  \u26a0  WRONG IMAGE \u2014 select the correct key image",
+                        _C["accent2"], "white", bold=True)
+                    self._img_picker.set_error()
+                elif status == LOGIN_WRONG_PWD:
+                    self._set_banner(
+                        "  \u26a0  WRONG PASSWORD \u2014 try again",
+                        _C["accent2"], "white", bold=True)
+                else:
+                    self._set_banner(
+                        "  \u26a0  Error reading vault or image",
+                        _C["accent2"], "white", bold=True)
+            self.after(0, _ui)
+
+        threading.Thread(target=_auth, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Honey Vault  (shown when honey/decoy image is selected)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HoneyVaultWindow(ttk.Frame):
+    """
+    Convincing fake vault shown when the honey image is used.
+    Real vault is never touched. Attacker sees plausible entries.
+    """
+
+    _FAKE = [
+        ("Gmail",       "gmail.com",    "john.doe.1987@gmail.com"),
+        ("Facebook",    "facebook.com", "john.doe.1987@gmail.com"),
+        ("Amazon",      "amazon.com",   "jdoe_shopper"),
+        ("Netflix",     "netflix.com",  "john.doe.1987@gmail.com"),
+        ("LinkedIn",    "linkedin.com", "john.doe.work@gmail.com"),
+        ("GitHub",      "github.com",   "johndoe_dev"),
+        ("Bank Online", "mybank.com",   "johndoe_private"),
+        ("PayPal",      "paypal.com",   "john.doe.1987@gmail.com"),
+    ]
+
+    def __init__(self, master: tk.Tk):
+        super().__init__(master)
+        self.pack(fill="both", expand=True)
+        self._build()
+
+    def _build(self):
+        # Header
+        hdr = tk.Frame(self, bg=_C["panel"]); hdr.pack(fill="x")
+        tk.Frame(hdr, bg=_C["accent"], height=2).pack(fill="x")
+        inner = tk.Frame(hdr, bg=_C["panel"])
+        inner.pack(fill="x", padx=16, pady=10)
+        _lbl(inner, "\u2b21  VAULT", font=_FT, color=_C["accent"]).pack(side="left")
+        _btn(inner, "\U0001f512 LOCK",
+             self._fake_lock, style="Ghost.TButton").pack(side="right", padx=3)
+        _btn(inner, "\u2715",
+             self.master.destroy, style="Danger.TButton").pack(side="right", padx=3)
+
+        # Toolbar
+        tb = tk.Frame(self, bg=_C["bg"]); tb.pack(fill="x", padx=14, pady=(6, 2))
+        for txt, sty in [
+            ("  \uff0b  ADD",        "Accent.TButton"),
+            ("  \u270f  EDIT",      "Ghost.TButton"),
+            ("  \U0001f50e  VIEW",  "Ghost.TButton"),
+            ("  \U0001f5d1  DELETE","Danger.TButton"),
+        ]:
+            _btn(tb, txt, lambda: None, style=sty).pack(side="left", padx=(0, 4))
+
+        # Search
+        sf = tk.Frame(self, bg=_C["bg"]); sf.pack(fill="x", padx=14, pady=4)
+        _lbl(sf, "SEARCH:", color=_C["fg2"], font=_FS).pack(side="left", padx=(0, 8))
+        ttk.Entry(sf, width=40).pack(side="left")
+
+        # Fake table
+        outer = tk.Frame(self, bg=_C["border"])
+        outer.pack(fill="both", expand=True, padx=14, pady=6)
+        cols  = ("Name / Label", "URL / Website", "Password", "Modified")
+        tree  = ttk.Treeview(outer, columns=cols, show="headings",
+                              selectmode="browse")
+        for col, w in zip(cols, (185, 195, 210, 130)):
+            tree.heading(col, text=col)
+            tree.column(col, width=w, anchor="w", stretch=True)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+
+        now = int(time.time())
+        for name, url, _ in self._FAKE:
+            mod = time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(now - secrets.randbelow(8_000_000)))
+            tree.insert("", "end",
+                values=(name, url,
+                        "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", mod))
+
+        # Footer
+        ft = tk.Frame(self, bg=_C["panel"]); ft.pack(fill="x")
+        tk.Frame(ft, bg=_C["border"], height=1).pack(fill="x")
+        inner2 = tk.Frame(ft, bg=_C["panel"])
+        inner2.pack(fill="x", padx=16, pady=4)
+        n = len(self._FAKE)
+        tk.Label(inner2, text=f"{n} of {n} entries",
+                 bg=_C["panel"], fg=_C["fg2"], font=_FS).pack(side="left")
+        tk.Label(inner2,
+                 text=f"Clipboard: {CLIPBOARD_CLEAR_SEC}s  \u00b7  "
+                      f"Auto-lock: {AUTO_LOCK_SEC // 60} min  \u00b7  "
+                      f"Vault: {VAULT_FILE.name}",
+                 bg=_C["panel"], fg=_C["fg2"], font=_FS).pack(side="right")
+
+    def _fake_lock(self):
+        self.destroy()
+        _show_lock_screen(self.master)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Add / Edit Entry Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EntryDialog(tk.Toplevel):
+
+    def __init__(self, master: tk.Tk, session: Session,
+                 entry_id: Optional[str] = None):
+        super().__init__(master)
+        self.session  = session
+        self.entry_id = entry_id
+        self.saved    = False
+        self.title("Edit Entry" if entry_id else "New Entry")
+        self.configure(bg=_C["bg"])
+        self.resizable(False, False)
+        _center(self, 500, 490)
+        self.grab_set()
+        self._build()
+        if entry_id:
+            self._load()
+        self.bind_all("<Key>",    lambda _: self.session.touch(), "+")
+        self.bind_all("<Button>", lambda _: self.session.touch(), "+")
+
+    def _build(self):
+        is_edit = bool(self.entry_id)
+        tk.Frame(self, bg=_C["accent"], height=2).pack(fill="x")
+        tk.Frame(self, height=12, bg=_C["bg"]).pack()
+        _lbl(self, "  \u270f  EDIT ENTRY" if is_edit else "  \uff0b  NEW ENTRY",
+             font=_FT, color=_C["accent"]).pack(padx=28, anchor="w")
+        tk.Frame(self, height=6, bg=_C["bg"]).pack()
+        _sep(self).pack(fill="x", padx=28)
+        tk.Frame(self, height=10, bg=_C["bg"]).pack()
+
+        f = ttk.Frame(self); f.pack(fill="x", padx=28)
+        f.columnconfigure(1, weight=1)
+
+        def _row(r, label, show=False):
+            _lbl(f, label, color=_C["fg2"], font=_FS).grid(
+                row=r*2, column=0, columnspan=3, sticky="w", pady=(6, 1))
+            e = _entry(f, show="\u25cf" if show else None, width=34)
+            e.grid(row=r*2+1, column=0, columnspan=2, sticky="ew", padx=(0, 4))
+            return e
+
+        self._name  = _row(0, "NAME / LABEL  *")
+        self._url   = _row(1, "URL / WEBSITE")
+        self._user  = _row(2, "USERNAME / EMAIL  *")
+
+        _lbl(f, "PASSWORD  *", color=_C["fg2"], font=_FS).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(6, 1))
+        self._pass_var  = tk.StringVar()
+        self._show_pass = tk.BooleanVar(value=False)
+        self._pass_e    = ttk.Entry(f, textvariable=self._pass_var,
+                                     show="\u25cf", width=26)
+        self._pass_e.grid(row=7, column=0, sticky="ew", padx=(0, 4))
+
+        def _toggle():
+            self._pass_e.config(show="" if self._show_pass.get() else "\u25cf")
+        ttk.Checkbutton(f, text="Show", variable=self._show_pass,
+                         command=_toggle).grid(row=7, column=1, padx=2)
+        _btn(f, "\u26a1 Generate", self._gen_pw,
+             style="Ghost.TButton").grid(row=7, column=2, padx=(4, 0))
+
+        self._notes = _row(4, "NOTES")
+
+        self._err = tk.Label(self, text="", bg=_C["bg"],
+                              fg=_C["accent2"], font=_FS)
+        self._err.pack(padx=28, anchor="w", pady=6)
+
+        bf = ttk.Frame(self); bf.pack(padx=28, pady=10, anchor="w")
+        _btn(bf, "  SAVE  ", self._save,
+             style="Accent.TButton").pack(side="left", padx=(0, 8))
+        _btn(bf, "Cancel", self.destroy).pack(side="left")
+
+    def _gen_pw(self):
+        pw = generate_password(20)
+        self._pass_var.set(pw)
+        self._pass_e.config(show="")
+        self._show_pass.set(True)
+
+    def _load(self):
+        data = self.session.decrypt(self.entry_id)
+        if not data:
+            messagebox.showerror("Decryption Error",
+                "Could not decrypt entry.\nVault may have been tampered with.",
+                parent=self)
+            self.destroy(); return
+        self._name.insert(0,  data.get("name",     ""))
+        self._url.insert(0,   data.get("url",      ""))
+        self._user.insert(0,  data.get("username", ""))
+        self._pass_var.set(   data.get("password", ""))
+        self._notes.insert(0, data.get("notes",    ""))
+
+    def _save(self):
+        name  = self._name.get().strip()
+        url   = self._url.get().strip()
+        user  = self._user.get().strip()
+        pw    = self._pass_var.get()
+        notes = self._notes.get().strip()
+
+        if not name:
+            self._err.config(text="Name is required."); return
+        if not user:
+            self._err.config(text="Username is required."); return
+        if not pw:
+            self._err.config(text="Password is required."); return
+
+        self._err.config(text="\u23f3  Saving\u2026")
+        self.update_idletasks()
+
+        entry_id = self.entry_id
+        session  = self.session
+
+        def _do_save():
+            if entry_id:
+                session.update(entry_id, name, url, user, pw, notes)
+            else:
+                session.add(name, url, user, pw, notes)
+            zero_bytes(bytearray(pw.encode()))
+            def _finish():
+                try:
+                    self.saved = True
+                    self.destroy()
+                except Exception:
+                    pass
+            self.after(0, _finish)
+
+        threading.Thread(target=_do_save, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  View / Reveal Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ViewDialog(tk.Toplevel):
+
+    def __init__(self, master: tk.Tk, session: Session,
+                 entry_id: str, root_ref: tk.Tk):
+        super().__init__(master)
+        self.session  = session
+        self.entry_id = entry_id
+        self.root_ref = root_ref
+        self.title("View Entry")
+        self.configure(bg=_C["bg"])
+        self.resizable(False, False)
+        _center(self, 530, 410)
+        self.grab_set()
+        self._build()
+        self.bind_all("<Key>",    lambda _: self.session.touch(), "+")
+        self.bind_all("<Button>", lambda _: self.session.touch(), "+")
+
+    def _build(self):
+        data = self.session.decrypt(self.entry_id)
+        if not data:
+            messagebox.showerror("Integrity Error",
+                "Decryption failed.\nEntry may have been tampered with.",
+                parent=self)
+            self.destroy(); return
+
+        tk.Frame(self, bg=_C["accent"], height=2).pack(fill="x")
+        tk.Frame(self, height=12, bg=_C["bg"]).pack()
+        _lbl(self, f"  \U0001f50e  {data['name']}",
+             font=_FH, color=_C["accent"]).pack(padx=28, anchor="w")
+        tk.Frame(self, height=6, bg=_C["bg"]).pack()
+        _sep(self).pack(fill="x", padx=28)
+        tk.Frame(self, height=10, bg=_C["bg"]).pack()
+
+        c = ttk.Frame(self); c.pack(fill="x", padx=28)
+        c.columnconfigure(1, weight=1)
+
+        def _val_label(parent, row, text_value):
+            lbl = tk.Label(parent, text=text_value,
+                           bg=_C["bg"], fg=_C["fg"], font=_F, anchor="w")
+            lbl.grid(row=row, column=1, sticky="w", pady=6)
+            return lbl
+
+        def _val_var_label(parent, row, sv):
+            lbl = tk.Label(parent, textvariable=sv,
+                           bg=_C["bg"], fg=_C["fg"], font=_F, anchor="w")
+            lbl.grid(row=row, column=1, sticky="w", pady=6)
+            return lbl
+
+        def _v(raw: str) -> str:
+            return raw if raw and raw.strip() else "\u2014"
+
+        rows = [
+            ("URL",      _v(data.get("url",      "")), True),
+            ("USERNAME", _v(data.get("username", "")), True),
+            ("PASSWORD", _v(data.get("password", "")), True),
+            ("NOTES",    _v(data.get("notes",    "")), False),
+        ]
+
+        for r, (label, val, copyable) in enumerate(rows):
+            tk.Label(c, text=label, bg=_C["bg"], fg=_C["fg2"],
+                     font=_FS, anchor="w", width=10).grid(
+                row=r, column=0, sticky="w", pady=6, padx=(0, 14))
+            col = 2
+            if label == "PASSWORD":
+                sv = tk.StringVar(
+                    value="\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf")
+                _val_var_label(c, r, sv)
+                def _tog(sv=sv, v=val, st=[True]):
+                    st[0] = not st[0]
+                    sv.set("\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf\u25cf"
+                           if st[0] else v)
+                _btn(c, "Reveal", _tog,
+                     style="Ghost.TButton").grid(row=r, column=col, padx=3)
+                col += 1
+            else:
+                _val_label(c, r, val)
+            if copyable:
+                v = val
+                def _copy(text=v, lbl=label):
+                    self.session.copy_to_clipboard(self.root_ref, text)
+                    _toast(self.root_ref,
+                           f"{lbl} copied \u2014 clears in {CLIPBOARD_CLEAR_SEC}s")
+                _btn(c, "Copy", _copy,
+                     style="Ghost.TButton").grid(row=r, column=col, padx=3)
+
+        tk.Frame(self, height=6, bg=_C["bg"]).pack()
+        _sep(self).pack(fill="x", padx=28)
+        _lbl(self,
+             f"\u23f1  Clipboard clears after {CLIPBOARD_CLEAR_SEC}s  \u00b7  "
+             f"Auto-lock in {AUTO_LOCK_SEC // 60} min idle",
+             color=_C["fg2"], font=_FS).pack(padx=28, anchor="w", pady=8)
+        _btn(self, "  Close  ", self.destroy,
+             style="Ghost.TButton").pack(padx=28, anchor="w")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main Vault Window
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VaultWindow(ttk.Frame):
+
+    def __init__(self, master: tk.Tk, session: Session):
+        super().__init__(master)
+        self.master           = master
+        self.session          = session
+        self._revealed: dict  = {}
+        self._decrypting: set = set()
+        self.session._on_auto_lock_cb = self._on_auto_lock
+        self.pack(fill="both", expand=True)
+        self._build_header()
+        self._build_toolbar()
+        self._build_search()
+        self._build_table()
+        self._build_footer()
+        self.refresh()
+        self.bind_all("<Key>",    lambda _: self.session.touch(), "+")
+        self.bind_all("<Button>", lambda _: self.session.touch(), "+")
+
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=_C["panel"]); hdr.pack(fill="x")
+        tk.Frame(hdr, bg=_C["accent"], height=2).pack(fill="x")
+        inner = tk.Frame(hdr, bg=_C["panel"])
+        inner.pack(fill="x", padx=16, pady=10)
+        _lbl(inner, "\u2b21  VAULT", font=_FT,
+             color=_C["accent"]).pack(side="left")
+        for text, cmd, sty in [
+            ("\U0001f512 LOCK", self._lock,      "Ghost.TButton"),
+            ("\u2715",          self._safe_quit, "Danger.TButton"),
+        ]:
+            _btn(inner, text, cmd, style=sty).pack(side="right", padx=3)
+
+    def _build_toolbar(self):
+        tb = tk.Frame(self, bg=_C["bg"]); tb.pack(fill="x", padx=14, pady=(6, 2))
+        for text, cmd, sty in [
+            ("  \uff0b  ADD",        self._add,    "Accent.TButton"),
+            ("  \u270f  EDIT",      self._edit,   "Ghost.TButton"),
+            ("  \U0001f50e  VIEW",  self._view,   "Ghost.TButton"),
+            ("  \U0001f5d1  DELETE",self._delete, "Danger.TButton"),
+        ]:
+            _btn(tb, text, cmd, style=sty).pack(side="left", padx=(0, 4))
+
+    def _build_search(self):
+        sf = tk.Frame(self, bg=_C["bg"]); sf.pack(fill="x", padx=14, pady=4)
+        _lbl(sf, "SEARCH:", color=_C["fg2"], font=_FS).pack(side="left", padx=(0, 8))
+        self._q = tk.StringVar()
+        self._q.trace_add("write", lambda *_: self.refresh())
+        ttk.Entry(sf, textvariable=self._q, width=40).pack(side="left")
+        _lbl(sf, "  name & URL only  \u00b7  passwords stay encrypted",
+             color=_C["fg2"], font=_FS).pack(side="left", padx=8)
+
+    def _build_table(self):
+        outer = tk.Frame(self, bg=_C["border"])
+        outer.pack(fill="both", expand=True, padx=14, pady=6)
+        cols = ("Name / Label", "URL / Website", "Password", "Modified")
+        self._tree = ttk.Treeview(outer, columns=cols, show="headings",
+                                   selectmode="browse")
+        for col, w in zip(cols, (185, 195, 210, 130)):
+            self._tree.heading(col, text=col)
+            self._tree.column(col, width=w, anchor="w", stretch=True)
+        self._tree.tag_configure("revealed",
+            foreground=_C["accent"], font=("Consolas", 10, "bold"))
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
+        self._tree.bind("<Double-1>", lambda _: self._open_dialog())
+        self._tree.bind("<Return>",   lambda _: self._open_dialog())
+        self._tree.bind("<Delete>",   lambda _: self._delete())
+
+    def _build_footer(self):
+        ft = tk.Frame(self, bg=_C["panel"]); ft.pack(fill="x")
+        tk.Frame(ft, bg=_C["border"], height=1).pack(fill="x")
+        inner = tk.Frame(ft, bg=_C["panel"])
+        inner.pack(fill="x", padx=16, pady=4)
+        self._fv = tk.StringVar()
+        tk.Label(inner, textvariable=self._fv,
+                 bg=_C["panel"], fg=_C["fg2"], font=_FS).pack(side="left")
+        tk.Label(inner,
+                 text=f"Clipboard: {CLIPBOARD_CLEAR_SEC}s  \u00b7  "
+                      f"Auto-lock: {AUTO_LOCK_SEC // 60} min  \u00b7  "
+                      f"Vault: {VAULT_FILE.name}",
+                 bg=_C["panel"], fg=_C["fg2"], font=_FS).pack(side="right")
+
+    def refresh(self):
+        q     = self._q.get().lower().strip() if hasattr(self, "_q") else ""
+        self._tree.delete(*self._tree.get_children())
+        all_e = storage_list_entries()
+        shown = 0
+        for e in all_e:
+            if q and q not in e["name"].lower() \
+               and q not in e.get("url", "").lower():
+                continue
+            mod = time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(e.get("modified_at", 0)))
+            eid = e["id"]
+            if eid in self._revealed:
+                pw_cell = self._revealed[eid]
+                tag     = ("revealed",)
+            else:
+                pw_cell = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+                tag     = ()
+            self._tree.insert("", "end", iid=eid,
+                values=(e["name"], e.get("url", ""), pw_cell, mod),
+                tags=tag)
+            shown += 1
+        total = len(all_e)
+        hint  = f"  \u00b7  {len(self._revealed)} revealed" if self._revealed else ""
+        self._fv.set(
+            f"{shown} of {total} entr{'y' if total == 1 else 'ies'}"
+            + (f"  \u00b7  Filter: \"{q}\"" if q else "")
+            + hint)
+
+    def _sel(self) -> Optional[str]:
+        s = self._tree.selection(); return s[0] if s else None
+
+    def _need_sel(self, action: str) -> Optional[str]:
+        eid = self._sel()
+        if not eid:
+            messagebox.showinfo("No Selection",
+                f"Please select an entry to {action}.", parent=self.master)
+        return eid
+
+    def _add(self):
+        d = EntryDialog(self.master, self.session)
+        self.master.wait_window(d)
+        if d.saved: self.refresh()
+
+    def _edit(self):
+        eid = self._need_sel("edit")
+        if not eid: return
+        d = EntryDialog(self.master, self.session, entry_id=eid)
+        self.master.wait_window(d)
+        if d.saved: self.refresh()
+
+    def _view(self):
+        eid = self._need_sel("reveal/hide")
+        if not eid: return
+
+        if eid in self._revealed:
+            pw_plain = self._revealed.pop(eid)
+            zero_bytes(bytearray(pw_plain.encode("utf-8")))
+            self.refresh()
+            _toast(self.master, "Password hidden")
+            return
+
+        if eid in self._decrypting:
+            return
+        self._decrypting.add(eid)
+
+        def _do():
+            data = self.session.decrypt(eid)
+            def _done():
+                self._decrypting.discard(eid)
+                if not data:
+                    _toast(self.master, "Decryption failed")
+                    return
+                self._revealed[eid] = data.get("password", "")
+                self.refresh()
+                _toast(self.master, "Password shown \u2014 click VIEW to hide")
+            self.master.after(0, _done)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _open_dialog(self):
+        eid = self._need_sel("view")
+        if not eid: return
+        ViewDialog(self.master, self.session, eid, self.master)
+
+    def _delete(self):
+        eid = self._need_sel("delete")
+        if not eid: return
+        name = self._tree.item(eid)["values"][0]
+        if messagebox.askyesno(
+            "Confirm Deletion",
+            f"Permanently delete  '{name}'?\nThis cannot be undone.",
+            icon="warning", parent=self.master):
+            self.session.delete(eid)
+            self.refresh()
+
+    def _lock(self):
+        self._zero_revealed()
+        self.session.logout()
+        self.destroy()
+        _show_lock_screen(self.master)
+
+    def _safe_quit(self):
+        self._zero_revealed()
+        self.session.logout()
+        self.master.destroy()
+
+    def _zero_revealed(self):
+        for pw in self._revealed.values():
+            zero_bytes(bytearray(pw.encode("utf-8")))
+        self._revealed.clear()
+
+    def _on_auto_lock(self):
+        try:
+            self.master.after(0, self._do_auto_lock)
+        except Exception:
+            pass
+
+    def _do_auto_lock(self):
+        self._zero_revealed()
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Auto-Locked",
+            f"Vault locked after {AUTO_LOCK_SEC // 60} minutes of inactivity.",
+            parent=self.master)
+        _show_lock_screen(self.master)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bootstrap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_lock_screen(root: tk.Tk) -> None:
+    session = Session()
+    dlg     = LockScreen(root, session)
+    root.wait_window(dlg)
+
+    if getattr(dlg, "_honey", False):
+        HoneyVaultWindow(root)
+        return
+
+    if not session.active:
+        root.destroy()
+        return
+
+    VaultWindow(root, session)
+
+
+def main() -> None:
+    root = tk.Tk()
+    root.title("\u2b21  Secure Password Manager  v7.0")
+    root.configure(bg=_C["bg"])
+    root.minsize(740, 460)
+    _center(root, 820, 560)
+    _apply_theme(root)
+
+    def _on_close():
+        for w in root.winfo_children():
+            if isinstance(w, VaultWindow):
+                w._zero_revealed()
+                w.session.logout()
+                break
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    if not vault_exists():
+        setup = SetupDialog(root)
+        root.wait_window(setup)
+        if not setup.result:
+            root.destroy()
+            return
+        messagebox.showinfo(
+            "Vault Initialized",
+            f"Vault created at:\n{VAULT_FILE}\n\n"
+            "Remember:\n"
+            "  \u2022 You need BOTH password AND key image to unlock.\n"
+            "  \u2022 Back up your key image to at least 2 USB drives.\n"
+            "  \u2022 Losing the key image = permanent lockout.",
+            parent=root)
+
+    _show_lock_screen(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
